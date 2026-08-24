@@ -1,0 +1,96 @@
+# GA armv7 rebuild of the upstream cli plugin (T4, Odoo #708).
+# Same structure and rationale as plugin-dns/build-ga-armv7.yml: upstream
+# dropped armv7 on master; rebuild the pinned tag's source under our namespace,
+# gated by /init smoke + fail-closed CVE gate + tag-must-match-env guard.
+# version == docker tag == io.hass.version label.
+name: Build GA armv7 cli plugin
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Must equal PUBLISH_VERSION below (guard against accidental minting)"
+        required: true
+
+env:
+  PUBLISH_VERSION: "2025.10.1"
+  UPSTREAM_VERSION: "2025.10.0"
+  CLI_VERSION: "4.42.0"
+  RLWRAP_VERSION: "0.46.1"
+  BUILD_FROM: "ghcr.io/home-assistant/armv7-base:3.22@sha256:ae2b8be31fee7bd01078d5ca51e7c48aa323ccbaca8085420a416e354b101246"
+  IMAGE: "ghcr.io/greenautarky/armv7-hassio-cli"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-prove-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Guard - release_tag must match the pinned version
+        run: |
+          if [ "${{ inputs.release_tag }}" != "${PUBLISH_VERSION}" ]; then
+            echo "::error::release_tag '${{ inputs.release_tag }}' != pinned PUBLISH_VERSION '${PUBLISH_VERSION}' - refusing"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+
+      - name: Build (armv7, upstream source at parity)
+        run: |
+          docker buildx build --platform linux/arm/v7 --load \
+            --build-arg BUILD_FROM="${BUILD_FROM}" \
+            --build-arg BUILD_ARCH=armv7 \
+            --build-arg CLI_VERSION="${CLI_VERSION}" \
+            --build-arg RLWRAP_VERSION="${RLWRAP_VERSION}" \
+            --label io.hass.type=cli \
+            --label io.hass.arch=armv7 \
+            --label io.hass.version="${PUBLISH_VERSION}" \
+            --label org.opencontainers.image.source="https://github.com/${{ github.repository }}" \
+            --label org.opencontainers.image.version="${PUBLISH_VERSION}" \
+            --label ga.upstream.version="${UPSTREAM_VERSION}" \
+            -t "${IMAGE}:${PUBLISH_VERSION}" .
+
+      - name: Smoke - /init boot, no entrypoint override (the exec-bit class)
+        run: |
+          docker run -d --name smoke --platform linux/arm/v7 "${IMAGE}:${PUBLISH_VERSION}"
+          sleep 15
+          state=$(docker inspect smoke --format '{{.State.Status}}')
+          echo "state=$state"
+          docker logs smoke 2>&1 | tail -20
+          if docker logs smoke 2>&1 | grep -qiE "permission denied|exited 126"; then
+            echo "::error::exec-bit class failure in /init boot"; exit 1
+          fi
+          [ "$state" = "running" ] || { echo "::error::container not running"; exit 1; }
+          docker exec smoke ha help >/dev/null || { echo "::error::ha CLI does not execute"; exit 1; }
+          docker rm -f smoke
+
+      - name: CVE gate (fail closed on zero coverage, budget-pinned)
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+          trivy image --format json --output /tmp/scan.json "${IMAGE}:${PUBLISH_VERSION}"
+          python3 - <<'PY'
+          import json
+          d = json.load(open("/tmp/scan.json"))
+          counts = {}
+          for r in d.get("Results", []):
+              for v in r.get("Vulnerabilities") or []:
+                  counts[v["Severity"]] = counts.get(v["Severity"], 0) + 1
+          total_results = len(d.get("Results", []))
+          print(f"results={total_results} counts={counts}")
+          if total_results == 0:
+              raise SystemExit("COVERAGE ZERO - a scan that inspected nothing is a failure, not a pass")
+          # Budget = measured at fork time (C3/H61). Gate against regression, not zero.
+          if counts.get("CRITICAL", 0) > 3 or counts.get("HIGH", 0) > 65:
+              raise SystemExit(f"CVE budget exceeded: {counts}")
+          PY
+
+      - name: Push
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "${IMAGE}:${PUBLISH_VERSION}"
