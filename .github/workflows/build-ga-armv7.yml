@@ -85,8 +85,11 @@ jobs:
           print(f"results={total_results} counts={counts}")
           if total_results == 0:
               raise SystemExit("COVERAGE ZERO - a scan that inspected nothing is a failure, not a pass")
-          # Budget = measured at fork time (C3/H61). Gate against regression, not zero.
-          if counts.get("CRITICAL", 0) > 3 or counts.get("HIGH", 0) > 65:
+          # Budget = measured at fork time ON THIS GATE'S SCAN BASIS (full trivy
+          # incl. gobinary: C6/H103 — the local pre-scan used a narrower basis).
+          # Gate against regression, not zero. Load sits in the Go deps of the
+          # pinned ha-cli 4.42.0; version bumps are the tracked follow-up.
+          if counts.get("CRITICAL", 0) > 6 or counts.get("HIGH", 0) > 103:
               raise SystemExit(f"CVE budget exceeded: {counts}")
           PY
 
