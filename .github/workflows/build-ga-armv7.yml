@@ -3,6 +3,10 @@
 # dropped armv7 on master; rebuild the pinned tag's source under our namespace,
 # gated by /init smoke + fail-closed CVE gate + tag-must-match-env guard.
 # version == docker tag == io.hass.version label.
+#
+# A pull request runs the same build, smoke and CVE gate WITHOUT publishing,
+# and keeps the built image as a short-lived workflow artifact so it can be
+# inspected before a release is cut. Publishing stays a workflow_dispatch.
 name: Build GA armv7 cli plugin
 
 on:
@@ -11,9 +15,11 @@ on:
       release_tag:
         description: "Must equal PUBLISH_VERSION below (guard against accidental minting)"
         required: true
+  pull_request:
+    branches: [ga-armv7]
 
 env:
-  PUBLISH_VERSION: "2025.10.1"
+  PUBLISH_VERSION: "2025.10.2"
   UPSTREAM_VERSION: "2025.10.0"
   CLI_VERSION: "4.42.0"
   RLWRAP_VERSION: "0.46.1"
@@ -29,6 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Guard - release_tag must match the pinned version
+        if: github.event_name == 'workflow_dispatch'
         run: |
           if [ "${{ inputs.release_tag }}" != "${PUBLISH_VERSION}" ]; then
             echo "::error::release_tag '${{ inputs.release_tag }}' != pinned PUBLISH_VERSION '${PUBLISH_VERSION}' - refusing"
@@ -93,7 +100,20 @@ jobs:
               raise SystemExit(f"CVE budget exceeded: {counts}")
           PY
 
+      - name: Keep the built image (pull request only, not a release)
+        if: github.event_name == 'pull_request'
+        run: docker save "${IMAGE}:${PUBLISH_VERSION}" -o "armv7-hassio-cli_${PUBLISH_VERSION}.tar"
+
+      - name: Upload the built image
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: armv7-hassio-cli-image
+          path: armv7-hassio-cli_${{ env.PUBLISH_VERSION }}.tar
+          retention-days: 7
+
       - name: Push
+        if: github.event_name == 'workflow_dispatch'
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
           docker push "${IMAGE}:${PUBLISH_VERSION}"
